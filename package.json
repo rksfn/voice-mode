@@ -1,0 +1,32 @@
+{
+  "name": "pi-voice-mode",
+  "version": "0.1.0",
+  "description": "Context-aware voice input for pi. Speak a request, get a formulated prompt at the cursor.",
+  "license": "MIT",
+  "author": "Erik Safian",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "voice",
+    "speech-to-text"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rksfn/voice-mode.git"
+  },
+  "homepage": "https://github.com/rksfn/voice-mode",
+  "bugs": {
+    "url": "https://github.com/rksfn/voice-mode/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/voice-mode/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
