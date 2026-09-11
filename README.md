@@ -26,7 +26,14 @@ pi -e ./extensions/voice-mode/index.ts
 
 ## Use
 
-Inside pi:
+Voice input starts in `tap` mode:
+
+```text
+Ctrl+Space     start recording
+Ctrl+Space     stop recording
+```
+
+Inside pi, use `/voice` to change modes:
 
 ```text
 /voice tap     Ctrl+Space starts; Ctrl+Space stops
@@ -35,7 +42,7 @@ Inside pi:
 /voice status
 ```
 
-`hold` needs a terminal with Kitty keyboard protocol support so pi receives key-release events. `tap` works as the fallback.
+`hold` needs a terminal with Kitty keyboard protocol support so pi receives key-release events. `tap` is the default and works as the fallback.
 
 The extension:
 

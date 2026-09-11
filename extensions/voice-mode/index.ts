@@ -2,7 +2,8 @@
  * Context-aware voice input for pi.
  *
  * Run: pi -e ./extensions/voice-mode/index.ts
- * Then: /voice tap   (or /voice hold in a Kitty-keyboard-capable terminal)
+ * Voice input starts in tap mode. Use /voice hold in a
+ * Kitty-keyboard-capable terminal, or /voice off to disable it.
  * Trigger: Ctrl+Space
  *
  * Records and transcribes speech, asks GPT-5.6 Luna to formulate it using
@@ -79,7 +80,7 @@ interface Transition {
 }
 
 const initialVoiceState: VoiceState = {
-	mode: "off",
+	mode: "tap",
 	phase: "idle",
 };
 
@@ -479,6 +480,7 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		disposed = false;
 		runtimeContext = ctx;
+		snapshot = { cwd: ctx.cwd, contextFiles: [] };
 		ctx.ui.onTerminalInput((data) => {
 			if (state.mode === "off" || !matchesKey(data, TRIGGER_KEY)) return;
 			const event = isKeyRelease(data) ? "release" : isKeyRepeat(data) ? "repeat" : "press";
