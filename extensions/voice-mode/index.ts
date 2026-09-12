@@ -6,16 +6,16 @@
  * Kitty-keyboard-capable terminal, or /voice off to disable it.
  * Trigger: Ctrl+Space
  *
- * Records and transcribes speech, asks GPT-5.6 Luna to formulate it using
- * the current project/session context, then inserts the result into the
- * editor for review. It deliberately does not auto-submit.
+ * Speech is transcribed in segments while recording continues, so only the
+ * trailing segment is outstanding when recording stops. GPT-5.6 Luna then
+ * formulates the transcript using the current project/session context and the
+ * result is inserted into the editor for review. It deliberately does not
+ * auto-submit.
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import type { UserMessage } from "@earendil-works/pi-ai";
+import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import type {
 	BuildSystemPromptOptions,
 	ExtensionAPI,
@@ -27,17 +27,31 @@ import {
 	isKeyRepeat,
 	isKittyProtocolActive,
 	matchesKey,
+	visibleWidth,
+	type EditorComponent,
 	type KeyId,
+	type TUI,
 } from "@earendil-works/pi-tui";
 
-const STATUS_KEY = "voice-mode";
 const TRIGGER_KEY = "ctrl+space" as KeyId;
+const CANCEL_KEY = "escape" as KeyId;
 const OPENROUTER_API_BASE = "https://openrouter.ai/api/v1";
 const DEFAULT_STT_MODEL = "openai/whisper-large-v3-turbo";
 const CODEX_REWRITE_MODEL = "gpt-5.6-luna";
 const OPENROUTER_REWRITE_MODEL = "openai/gpt-5.6-luna";
 const MAX_CONTEXT_CHARS = 24_000;
 const MAX_ERROR_CHARS = 2_000;
+const WAVE_SAMPLES = 16;
+const WAVE_BLOCKS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+const WAVE_RMS_FULL_SCALE = 0.1;
+const SAMPLE_RATE = 16_000;
+const LEVEL_WINDOW_SAMPLES = 1_600;
+const SILENCE_RMS = 0.01;
+const SILENCE_CUT_WINDOWS = 6;
+const MIN_SEGMENT_WINDOWS = 20;
+const MAX_SEGMENT_WINDOWS = 100;
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const ANIMATION_INTERVAL_MS = 90;
 
 const REWRITE_SYSTEM_PROMPT = `You turn rough dictated voice notes into a prompt for an AI coding agent.
 
@@ -70,9 +84,10 @@ type VoiceAction =
 	| { type: "trigger"; event: "press" | "repeat" | "release" }
 	| { type: "stage"; phase: "transcribing" | "formulating" }
 	| { type: "complete" }
+	| { type: "cancel" }
 	| { type: "fail"; message: string };
 
-type VoiceEffect = "start-recording" | "stop-and-process";
+type VoiceEffect = "start-recording" | "stop-and-process" | "abort";
 
 interface Transition {
 	state: VoiceState;
@@ -113,6 +128,14 @@ function transition(state: VoiceState, action: VoiceAction): Transition {
 		};
 	}
 
+	if (action.type === "cancel") {
+		if (state.phase === "idle") return { state, effects: [] };
+		return {
+			state: { ...state, phase: "idle", lastError: undefined },
+			effects: ["abort"],
+		};
+	}
+
 	if (state.mode === "off" || state.phase === "transcribing" || state.phase === "formulating") {
 		return { state, effects: [] };
 	}
@@ -149,28 +172,61 @@ function transition(state: VoiceState, action: VoiceAction): Transition {
 	return { state, effects: [] };
 }
 
+function wavFromPcm(pcm: Buffer): Buffer {
+	const header = Buffer.alloc(44);
+	header.write("RIFF", 0);
+	header.writeUInt32LE(36 + pcm.byteLength, 4);
+	header.write("WAVE", 8);
+	header.write("fmt ", 12);
+	header.writeUInt32LE(16, 16);
+	header.writeUInt16LE(1, 20);
+	header.writeUInt16LE(1, 22);
+	header.writeUInt32LE(SAMPLE_RATE, 24);
+	header.writeUInt32LE(SAMPLE_RATE * 2, 28);
+	header.writeUInt16LE(2, 32);
+	header.writeUInt16LE(16, 34);
+	header.write("data", 36);
+	header.writeUInt32LE(pcm.byteLength, 40);
+	return Buffer.concat([header, pcm]);
+}
+
 class MacRecorder {
 	private stderr = "";
+	private bytes = 0;
 	private readonly exitPromise: Promise<number | null>;
 
 	private constructor(
-		private readonly directory: string,
-		private readonly path: string,
 		private readonly child: ChildProcessWithoutNullStreams,
+		onWindow: (pcm: Buffer, level: number) => void,
 	) {
 		child.stderr.on("data", (chunk: Buffer) => {
 			this.stderr = (this.stderr + chunk.toString("utf8")).slice(-MAX_ERROR_CHARS);
 		});
+		let remainder = Buffer.alloc(0);
+		child.stdout.on("data", (chunk: Buffer) => {
+			this.bytes += chunk.byteLength;
+			const buffer = remainder.byteLength ? Buffer.concat([remainder, chunk]) : chunk;
+			let offset = 0;
+			while (buffer.byteLength - offset >= LEVEL_WINDOW_SAMPLES * 2) {
+				let sum = 0;
+				for (let index = 0; index < LEVEL_WINDOW_SAMPLES; index++) {
+					const sample = buffer.readInt16LE(offset + (index << 1)) / 32_768;
+					sum += sample * sample;
+				}
+				const window = Buffer.from(buffer.subarray(offset, offset + LEVEL_WINDOW_SAMPLES * 2));
+				offset += LEVEL_WINDOW_SAMPLES * 2;
+				onWindow(window, Math.sqrt(sum / LEVEL_WINDOW_SAMPLES));
+			}
+			remainder = Buffer.from(buffer.subarray(offset));
+		});
 		this.exitPromise = new Promise((resolve) => child.once("close", resolve));
 	}
 
-	static async start(): Promise<MacRecorder> {
+	static async start(onWindow: (pcm: Buffer, level: number) => void): Promise<MacRecorder> {
 		if (process.platform !== "darwin") {
 			throw new Error("Voice mode currently records on macOS only");
 		}
 
-		const directory = await mkdtemp(join(tmpdir(), "pi-voice-mode-"));
-		const path = join(directory, "recording.wav");
 		const device = process.env.VOICE_MODE_AUDIO_DEVICE ?? ":0";
 		const child = spawn(
 			"ffmpeg",
@@ -182,29 +238,27 @@ class MacRecorder {
 				"avfoundation",
 				"-i",
 				device,
+				"-flush_packets",
+				"1",
 				"-ac",
 				"1",
 				"-ar",
-				"16000",
-				"-y",
-				path,
+				String(SAMPLE_RATE),
+				"-f",
+				"s16le",
+				"pipe:1",
 			],
 			{ stdio: ["pipe", "pipe", "pipe"] },
 		);
 
-		try {
-			await new Promise<void>((resolve, reject) => {
-				child.once("spawn", resolve);
-				child.once("error", reject);
-			});
-			return new MacRecorder(directory, path, child);
-		} catch (error) {
-			await rm(directory, { recursive: true, force: true });
-			throw error;
-		}
+		await new Promise<void>((resolve, reject) => {
+			child.once("spawn", resolve);
+			child.once("error", reject);
+		});
+		return new MacRecorder(child, onWindow);
 	}
 
-	async stop(): Promise<Buffer> {
+	async stop(): Promise<void> {
 		try {
 			if (this.child.exitCode === null) {
 				this.child.stdin.write("q\n");
@@ -218,20 +272,16 @@ class MacRecorder {
 			if (code !== 0) {
 				throw new Error(this.stderr.trim() || `ffmpeg exited with code ${code}`);
 			}
-			const audio = await readFile(this.path);
-			if (audio.byteLength < 1_000) {
+			if (this.bytes < 1_000) {
 				throw new Error("Recording was empty; check Terminal microphone permission");
 			}
-			return audio;
 		} finally {
 			if (this.child.exitCode === null) this.child.kill("SIGKILL");
-			await rm(this.directory, { recursive: true, force: true });
 		}
 	}
 
-	async abort(): Promise<void> {
+	abort(): void {
 		if (this.child.exitCode === null) this.child.kill("SIGKILL");
-		await rm(this.directory, { recursive: true, force: true });
 	}
 }
 
@@ -281,7 +331,11 @@ function buildContext(ctx: ExtensionContext, snapshot: ContextSnapshot, draft: s
 		: `${context.slice(0, MAX_CONTEXT_CHARS)}\n\n[context truncated]`;
 }
 
-async function transcribe(audio: Buffer, ctx: ExtensionContext): Promise<string> {
+async function transcribe(
+	audio: Buffer,
+	ctx: ExtensionContext,
+	signal: AbortSignal,
+): Promise<string> {
 	const providerAuth = await ctx.modelRegistry.getProviderAuth("openrouter");
 	const apiKey = providerAuth?.auth.apiKey ?? process.env.OPENROUTER_API_KEY;
 	if (!apiKey) {
@@ -304,16 +358,72 @@ async function transcribe(audio: Buffer, ctx: ExtensionContext): Promise<string>
 			language: process.env.VOICE_MODE_LANGUAGE ?? "en",
 			temperature: 0,
 		}),
-		signal: AbortSignal.timeout(120_000),
+		signal: AbortSignal.any([signal, AbortSignal.timeout(120_000)]),
 	});
 
 	if (!response.ok) {
 		throw new Error(`OpenRouter transcription failed (${response.status}): ${(await response.text()).slice(0, MAX_ERROR_CHARS)}`);
 	}
 	const payload = (await response.json()) as { text?: string };
-	const transcript = payload.text?.trim();
-	if (!transcript) throw new Error("Transcriber returned no text");
-	return transcript;
+	return payload.text?.trim() ?? "";
+}
+
+/** Cuts live audio into segments at silence and transcribes them as they are cut. */
+class StreamingTranscriber {
+	private windows: Buffer[] = [];
+	private silentWindows = 0;
+	private voiced = false;
+	private readonly segments: Promise<string>[] = [];
+
+	constructor(
+		private readonly ctx: ExtensionContext,
+		private readonly signal: AbortSignal,
+	) {}
+
+	push(window: Buffer, level: number): void {
+		this.windows.push(window);
+		if (level < SILENCE_RMS) {
+			this.silentWindows++;
+		} else {
+			this.silentWindows = 0;
+			this.voiced = true;
+		}
+		const cutOnSilence =
+			this.voiced &&
+			this.silentWindows >= SILENCE_CUT_WINDOWS &&
+			this.windows.length >= MIN_SEGMENT_WINDOWS;
+		if (cutOnSilence || this.windows.length >= MAX_SEGMENT_WINDOWS) this.cut();
+	}
+
+	/** Buffered audio not yet handed to the transcriber, in milliseconds. */
+	get pendingMs(): number {
+		return (this.windows.length * LEVEL_WINDOW_SAMPLES * 1_000) / SAMPLE_RATE;
+	}
+
+	get segmentCount(): number {
+		return this.segments.length;
+	}
+
+	async finish(): Promise<string> {
+		this.cut();
+		const parts = await Promise.all(this.segments);
+		const transcript = parts.filter(Boolean).join(" ");
+		if (!transcript) throw new Error("Transcriber returned no text");
+		return transcript;
+	}
+
+	private cut(): void {
+		const windows = this.windows;
+		const voiced = this.voiced;
+		this.windows = [];
+		this.silentWindows = 0;
+		this.voiced = false;
+		// Whisper hallucinates stock phrases when handed pure silence.
+		if (!voiced) return;
+		const segment = transcribe(wavFromPcm(Buffer.concat(windows)), this.ctx, this.signal);
+		void segment.catch(() => {}); // the rejection is surfaced by finish()
+		this.segments.push(segment);
+	}
 }
 
 function rewriteModel(ctx: ExtensionContext): NonNullable<ExtensionContext["model"]> {
@@ -331,6 +441,7 @@ async function formulate(
 	transcript: string,
 	context: string,
 	ctx: ExtensionContext,
+	signal: AbortSignal,
 ): Promise<string> {
 	const message: UserMessage = {
 		role: "user",
@@ -345,7 +456,7 @@ async function formulate(
 	const response = await ctx.modelRegistry.complete(
 		rewriteModel(ctx),
 		{ systemPrompt: REWRITE_SYSTEM_PROMPT, messages: [message] },
-		{ signal: AbortSignal.timeout(120_000) },
+		{ signal: AbortSignal.any([signal, AbortSignal.timeout(120_000)]) },
 	);
 	if (response.stopReason === "error" || response.stopReason === "aborted") {
 		throw new Error(response.errorMessage ?? `Formulation ${response.stopReason}`);
@@ -360,32 +471,93 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 	let runtimeContext: ExtensionContext | undefined;
 	let snapshot: ContextSnapshot | undefined;
 	let recordingPromise: Promise<MacRecorder> | undefined;
+	let transcriber: StreamingTranscriber | undefined;
+	let pipeline: AbortController | undefined;
 	let draftAtStart = "";
 	let disposed = false;
+	let editorPatched = false;
+	let editorComponent: EditorComponent | undefined;
+	let tui: TUI | undefined;
+	let levels: number[] = [];
+	let spinnerFrame = 0;
+	let animation: ReturnType<typeof setInterval> | undefined;
+	let editorPatchTimer: ReturnType<typeof setTimeout> | undefined;
 
-	function renderStatus(): void {
-		if (!runtimeContext) return;
-		if (state.mode === "off") {
-			runtimeContext.ui.setStatus(STATUS_KEY, undefined);
-			return;
+	function waveform(): string {
+		let cells = "";
+		for (let index = 0; index < WAVE_SAMPLES; index++) {
+			const level = levels[levels.length - WAVE_SAMPLES + index] ?? 0;
+			// sqrt curve: linear RMS leaves normal speech pinned to the lowest block.
+			const scaled = Math.sqrt(Math.min(1, level / WAVE_RMS_FULL_SCALE));
+			cells += WAVE_BLOCKS[Math.min(WAVE_BLOCKS.length - 1, Math.floor(scaled * WAVE_BLOCKS.length))];
 		}
+		return cells;
+	}
+
+	function borderRow(
+		width: number,
+		hiddenLineCount: number,
+		borderColor: (text: string) => string,
+	): string | undefined {
+		if (!runtimeContext || state.mode === "off" || width <= 0) return undefined;
+		if (state.phase === "idle" && hiddenLineCount > 0) return undefined;
 		const theme = runtimeContext.ui.theme;
-		const text =
+		const label =
 			state.phase === "idle"
-				? `voice ${state.mode} · Ctrl+Space`
-				: state.phase === "recording"
-					? "● recording"
-					: state.phase === "transcribing"
-						? "voice · transcribing"
-						: "voice · formulating";
-		const color = state.phase === "recording" ? "error" : state.phase === "idle" ? "accent" : "warning";
-		runtimeContext.ui.setStatus(STATUS_KEY, theme.fg(color, text));
+				? theme.fg("muted", "ctrl+space to speak")
+				: `${
+						state.phase === "recording"
+							? theme.fg("success", waveform())
+							: theme.fg(
+									"warning",
+									`${SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length]} ${state.phase}…`,
+								)
+					}  ${theme.fg("muted", "esc to cancel")}`;
+		const used = 4 + visibleWidth(label);
+		if (used >= width) return undefined;
+		return borderColor("── ") + label + borderColor(` ${"─".repeat(width - used)}`);
+	}
+
+	function patchEditor(ctx: ExtensionContext): void {
+		if (editorPatched) return;
+		editorPatched = true;
+		const base = ctx.ui.getEditorComponent();
+		ctx.ui.setEditorComponent((ui, editorTheme, keybindings) => {
+			tui = ui;
+			const editor = base
+				? base(ui, editorTheme, keybindings)
+				: new CustomEditor(ui, editorTheme, keybindings);
+			editorComponent = editor;
+			const target = editor as unknown as {
+				renderTopBorder(width: number, hiddenLineCount: number): string;
+				borderColor?: (text: string) => string;
+			};
+			const original = target.renderTopBorder.bind(editor);
+			target.renderTopBorder = (width, hiddenLineCount) =>
+				borderRow(width, hiddenLineCount, target.borderColor ?? ((text) => text)) ??
+				original(width, hiddenLineCount);
+			return editor;
+		});
+	}
+
+	function syncAnimation(): void {
+		const animating = state.mode !== "off" && state.phase !== "idle";
+		if (animating && !animation) {
+			animation = setInterval(() => {
+				spinnerFrame++;
+				tui?.requestRender();
+			}, ANIMATION_INTERVAL_MS);
+		} else if (!animating && animation) {
+			clearInterval(animation);
+			animation = undefined;
+		}
+		tui?.requestRender();
 	}
 
 	function apply(action: VoiceAction): void {
 		const next = transition(state, action);
 		state = next.state;
-		renderStatus();
+		syncAnimation();
 		for (const effect of next.effects) runEffect(effect);
 	}
 
@@ -397,9 +569,29 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 
 	function runEffect(effect: VoiceEffect): void {
 		if (!runtimeContext) return;
+
+		if (effect === "abort") {
+			pipeline?.abort();
+			pipeline = undefined;
+			const pending = recordingPromise;
+			recordingPromise = undefined;
+			transcriber = undefined;
+			levels = [];
+			void pending?.then((recorder) => recorder.abort()).catch(() => {});
+			return;
+		}
+
 		if (effect === "start-recording") {
 			draftAtStart = runtimeContext.ui.getEditorText();
-			recordingPromise = MacRecorder.start();
+			levels = [];
+			pipeline = new AbortController();
+			const stream = new StreamingTranscriber(runtimeContext, pipeline.signal);
+			transcriber = stream;
+			recordingPromise = MacRecorder.start((window, level) => {
+				levels.push(level);
+				if (levels.length > WAVE_SAMPLES) levels.shift();
+				stream.push(window, level);
+			});
 			void recordingPromise.catch((error) => {
 				if (state.phase === "recording") fail(error);
 			});
@@ -407,26 +599,41 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 		}
 
 		const pendingRecording = recordingPromise;
+		const pendingTranscriber = transcriber;
+		const signal = pipeline?.signal;
 		recordingPromise = undefined;
+		transcriber = undefined;
 		void (async () => {
 			try {
-				if (!pendingRecording || !snapshot || !runtimeContext) {
+				if (!pendingRecording || !pendingTranscriber || !snapshot || !runtimeContext || !signal) {
 					throw new Error("No active recording");
 				}
+				const pressedAt = Date.now();
 				const recorder = await pendingRecording;
-				const audio = await recorder.stop();
-				if (disposed) return;
-				const transcript = await transcribe(audio, runtimeContext);
-				if (disposed) return;
+				await recorder.stop();
+				if (disposed || signal.aborted) return;
+				const recorderStoppedAt = Date.now();
+				const tailMs = pendingTranscriber.pendingMs;
+				const transcript = await pendingTranscriber.finish();
+				if (disposed || signal.aborted) return;
+				const transcribedAt = Date.now();
 				apply({ type: "stage", phase: "formulating" });
 				const context = buildContext(runtimeContext, snapshot, draftAtStart);
-				const prompt = await formulate(transcript, context, runtimeContext);
-				if (disposed) return;
-				runtimeContext.ui.pasteToEditor(prompt);
+				const prompt = await formulate(transcript, context, runtimeContext, signal);
+				if (disposed || signal.aborted) return;
+				const formulatedAt = Date.now();
+				runtimeContext.ui.notify(
+					`Voice timing: ffmpeg ${recorderStoppedAt - pressedAt}ms | transcribe ${transcribedAt - recorderStoppedAt}ms (tail ${Math.round(tailMs)}ms audio, ${pendingTranscriber.segmentCount} segments) | formulate ${formulatedAt - transcribedAt}ms (${context.length} ctx chars, ${transcript.length} transcript chars) | total ${formulatedAt - pressedAt}ms`,
+					"info",
+				);
+				if (editorComponent?.insertTextAtCursor) {
+					editorComponent.insertTextAtCursor(prompt);
+				} else {
+					runtimeContext.ui.pasteToEditor(prompt);
+				}
 				apply({ type: "complete" });
-				runtimeContext.ui.notify("Voice prompt inserted — review, then submit", "info");
 			} catch (error) {
-				if (!disposed) fail(error);
+				if (!disposed && !signal?.aborted) fail(error);
 			}
 		})();
 	}
@@ -443,10 +650,8 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 		runtimeContext = ctx;
 		const options = ctx.getSystemPromptOptions();
 		snapshot = { cwd: ctx.cwd, contextFiles: options.contextFiles ?? [] };
+		if (mode !== "off") patchEditor(ctx);
 		apply({ type: "set-mode", mode });
-		if (mode !== "off") {
-			ctx.ui.notify(`Voice ${mode} enabled · Ctrl+Space`, "info");
-		}
 	}
 
 	pi.registerCommand("voice", {
@@ -481,22 +686,42 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 		disposed = false;
 		runtimeContext = ctx;
 		snapshot = { cwd: ctx.cwd, contextFiles: [] };
+		// Other extensions (notably pi-vim) may replace the editor later in this
+		// session_start dispatch. Wrap the final factory on the next event-loop turn.
+		editorPatchTimer = setTimeout(() => {
+			editorPatchTimer = undefined;
+			if (!disposed && state.mode !== "off") patchEditor(ctx);
+		}, 0);
 		ctx.ui.onTerminalInput((data) => {
-			if (state.mode === "off" || !matchesKey(data, TRIGGER_KEY)) return;
+			if (state.mode === "off") return;
+			if (state.phase !== "idle" && matchesKey(data, CANCEL_KEY)) {
+				apply({ type: "cancel" });
+				return { consume: true };
+			}
+			if (!matchesKey(data, TRIGGER_KEY)) return;
 			const event = isKeyRelease(data) ? "release" : isKeyRepeat(data) ? "repeat" : "press";
 			apply({ type: "trigger", event });
 			return { consume: true };
 		});
-		renderStatus();
 	});
 
 	pi.on("session_shutdown", async () => {
 		disposed = true;
+		if (editorPatchTimer) {
+			clearTimeout(editorPatchTimer);
+			editorPatchTimer = undefined;
+		}
+		if (animation) {
+			clearInterval(animation);
+			animation = undefined;
+		}
+		pipeline?.abort();
 		const pending = recordingPromise;
 		recordingPromise = undefined;
+		transcriber = undefined;
 		if (pending) {
 			try {
-				await (await pending).abort();
+				(await pending).abort();
 			} catch {
 				// Nothing left to clean up.
 			}

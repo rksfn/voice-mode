@@ -1,5 +1,5 @@
 {
-  "name": "pi-voice-mode",
+  "name": "@rksfn/voice-mode",
   "version": "0.1.0",
   "description": "Context-aware voice input for pi. Speak a request, get a formulated prompt at the cursor.",
   "license": "MIT",
@@ -18,6 +18,14 @@
   "homepage": "https://github.com/rksfn/voice-mode",
   "bugs": {
     "url": "https://github.com/rksfn/voice-mode/issues"
+  },
+  "files": [
+    "extensions",
+    "LICENSE",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
   },
   "pi": {
     "extensions": [
