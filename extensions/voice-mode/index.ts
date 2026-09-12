@@ -9,13 +9,15 @@
  * Speech is transcribed in segments while recording continues, so only the
  * trailing segment is outstanding when recording stops. GPT-5.6 Luna then
  * formulates the transcript using the current project/session context and the
- * result is inserted into the editor for review. It deliberately does not
- * auto-submit.
+ * result is inserted into the editor. /voice send decides whether it is then
+ * submitted for you or held for review; manual is the default.
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { UserMessage } from "@earendil-works/pi-ai";
-import { CustomEditor } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type {
 	BuildSystemPromptOptions,
 	ExtensionAPI,
@@ -55,6 +57,7 @@ const MIN_SEGMENT_WINDOWS = 20;
 const MAX_SEGMENT_WINDOWS = 100;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const ANIMATION_INTERVAL_MS = 90;
+const SETTINGS_FILE = "voice-mode.json";
 
 const REWRITE_SYSTEM_PROMPT = `You turn a rough dictated voice note into a prompt for an AI coding agent that is already in this session and can already see the conversation.
 
@@ -85,6 +88,39 @@ interface ContextSnapshot {
 
 type VoiceMode = "off" | "hold" | "tap";
 type VoicePhase = "idle" | "recording" | "transcribing" | "formulating";
+
+/** Whether a formulated prompt is submitted for the user or left in the editor. */
+type SendBehavior = "auto" | "manual";
+
+interface VoiceSettings {
+	send: SendBehavior;
+}
+
+const defaultSettings: VoiceSettings = { send: "manual" };
+
+function settingsPath(): string {
+	return join(getAgentDir(), SETTINGS_FILE);
+}
+
+function loadSettings(): VoiceSettings {
+	let raw: string;
+	try {
+		raw = readFileSync(settingsPath(), "utf8");
+	} catch {
+		return defaultSettings;
+	}
+	try {
+		const parsed = JSON.parse(raw) as Partial<VoiceSettings>;
+		return { send: parsed.send === "auto" ? "auto" : "manual" };
+	} catch (error) {
+		throw new Error(`${settingsPath()} is not valid JSON: ${errorMessage(error)}`);
+	}
+}
+
+function saveSettings(settings: VoiceSettings): void {
+	mkdirSync(getAgentDir(), { recursive: true });
+	writeFileSync(settingsPath(), `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+}
 
 interface VoiceState {
 	mode: VoiceMode;
@@ -448,15 +484,6 @@ class StreamingTranscriber {
 		if (cutOnSilence || this.windows.length >= MAX_SEGMENT_WINDOWS) this.cut();
 	}
 
-	/** Buffered audio not yet handed to the transcriber, in milliseconds. */
-	get pendingMs(): number {
-		return (this.windows.length * LEVEL_WINDOW_SAMPLES * 1_000) / SAMPLE_RATE;
-	}
-
-	get segmentCount(): number {
-		return this.segments.length;
-	}
-
 	async finish(): Promise<string> {
 		this.cut();
 		const parts = await Promise.all(this.segments);
@@ -490,7 +517,8 @@ function rewriteModel(ctx: ExtensionContext): NonNullable<ExtensionContext["mode
 	return model;
 }
 
-async function formulate(
+async function completeFormulation(
+	model: NonNullable<ExtensionContext["model"]>,
 	transcript: string,
 	context: string,
 	ctx: ExtensionContext,
@@ -507,7 +535,7 @@ async function formulate(
 		timestamp: Date.now(),
 	};
 	const response = await ctx.modelRegistry.complete(
-		rewriteModel(ctx),
+		model,
 		{ systemPrompt: REWRITE_SYSTEM_PROMPT, messages: [message] },
 		{
 			reasoningEffort: "minimal",
@@ -522,8 +550,27 @@ async function formulate(
 	return prompt;
 }
 
+async function formulate(
+	transcript: string,
+	context: string,
+	ctx: ExtensionContext,
+	signal: AbortSignal,
+): Promise<string> {
+	const model = rewriteModel(ctx);
+	try {
+		return await completeFormulation(model, transcript, context, ctx, signal);
+	} catch (error) {
+		if (signal.aborted || model.provider !== "openai-codex") throw error;
+		const fallback = ctx.modelRegistry.find("openrouter", OPENROUTER_REWRITE_MODEL);
+		if (!fallback) throw error;
+		ctx.ui.notify("Voice mode: Codex unavailable; formulating via OpenRouter", "warning");
+		return completeFormulation(fallback, transcript, context, ctx, signal);
+	}
+}
+
 export default function voiceModeExtension(pi: ExtensionAPI) {
 	let state: VoiceState = initialVoiceState;
+	let settings: VoiceSettings = defaultSettings;
 	let runtimeContext: ExtensionContext | undefined;
 	let snapshot: ContextSnapshot | undefined;
 	let recordingPromise: Promise<Recorder> | undefined;
@@ -560,7 +607,10 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 		const theme = runtimeContext.ui.theme;
 		const label =
 			state.phase === "idle"
-				? theme.fg("muted", "ctrl+space to speak")
+				? theme.fg(
+						"muted",
+						settings.send === "auto" ? "ctrl+space to speak (auto-send)" : "ctrl+space to speak",
+					)
 				: `${
 						state.phase === "recording"
 							? theme.fg("success", waveform())
@@ -664,34 +714,51 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 				if (!pendingRecording || !pendingTranscriber || !snapshot || !runtimeContext || !signal) {
 					throw new Error("No active recording");
 				}
-				const pressedAt = Date.now();
 				const recorder = await pendingRecording;
 				await recorder.stop();
 				if (disposed || signal.aborted) return;
-				const recorderStoppedAt = Date.now();
-				const tailMs = pendingTranscriber.pendingMs;
 				const transcript = await pendingTranscriber.finish();
 				if (disposed || signal.aborted) return;
-				const transcribedAt = Date.now();
 				apply({ type: "stage", phase: "formulating" });
 				const context = buildContext(runtimeContext, snapshot, draftAtStart);
 				const prompt = await formulate(transcript, context, runtimeContext, signal);
 				if (disposed || signal.aborted) return;
-				const formulatedAt = Date.now();
-				runtimeContext.ui.notify(
-					`Voice timing: ffmpeg ${recorderStoppedAt - pressedAt}ms | transcribe ${transcribedAt - recorderStoppedAt}ms (tail ${Math.round(tailMs)}ms audio, ${pendingTranscriber.segmentCount} segments) | formulate ${formulatedAt - transcribedAt}ms | total ${formulatedAt - pressedAt}ms | ctx ${context.length} chars, transcript ${transcript.length} → prompt ${prompt.length} chars (${(prompt.length / Math.max(1, transcript.length)).toFixed(2)}x)`,
-					"info",
-				);
 				if (editorComponent?.insertTextAtCursor) {
 					editorComponent.insertTextAtCursor(prompt);
 				} else {
 					runtimeContext.ui.pasteToEditor(prompt);
 				}
 				apply({ type: "complete" });
+				if (settings.send === "auto") submitEditor(runtimeContext);
 			} catch (error) {
 				if (!disposed && !signal?.aborted) fail(error);
 			}
 		})();
+	}
+
+	/** Submits whatever now stands in the editor, so an existing draft rides along as it would on enter. */
+	function submitEditor(ctx: ExtensionContext): void {
+		const text = ctx.ui.getEditorText().trim();
+		if (!text) return;
+		ctx.ui.setEditorText("");
+		pi.sendUserMessage(text, ctx.isIdle() ? undefined : { deliverAs: "steer" });
+	}
+
+	function setSendBehavior(send: SendBehavior, ctx: ExtensionCommandContext): void {
+		try {
+			saveSettings({ ...settings, send });
+		} catch (error) {
+			ctx.ui.notify(`Voice mode: could not save ${settingsPath()}: ${errorMessage(error)}`, "error");
+			return;
+		}
+		settings = { ...settings, send };
+		tui?.requestRender();
+		ctx.ui.notify(
+			send === "auto"
+				? "Voice mode: formulated prompts will be sent automatically"
+				: "Voice mode: formulated prompts will wait in the editor",
+			"info",
+		);
 	}
 
 	function setMode(mode: VoiceMode, ctx: ExtensionCommandContext): void {
@@ -710,28 +777,37 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 		apply({ type: "set-mode", mode });
 	}
 
+	const VOICE_ARGS = ["hold", "tap", "off", "send auto", "send manual", "status"];
+
 	pi.registerCommand("voice", {
-		description: "Set context-aware voice input: /voice hold|tap|off|status",
+		description: "Set context-aware voice input: /voice hold|tap|off|send auto|send manual|status",
 		getArgumentCompletions: (prefix) =>
-			["hold", "tap", "off", "status"]
-				.filter((value) => value.startsWith(prefix))
-				.map((value) => ({ value, label: value })),
+			VOICE_ARGS.filter((value) => value.startsWith(prefix)).map((value) => ({
+				value,
+				label: value,
+			})),
 		handler: async (args, ctx) => {
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("Voice mode requires pi's interactive TUI", "error");
 				return;
 			}
-			let requested = args.trim().toLowerCase();
+			let requested = args.trim().toLowerCase().replace(/\s+/g, " ");
 			if (!requested) {
-				requested =
-					(await ctx.ui.select("Voice mode", ["hold", "tap", "off", "status"])) ?? "";
+				requested = (await ctx.ui.select("Voice mode", VOICE_ARGS)) ?? "";
 			}
 			if (requested === "status") {
-				ctx.ui.notify(`Voice mode: ${state.mode}; state: ${state.phase}`, "info");
+				ctx.ui.notify(
+					`Voice mode: ${state.mode}; state: ${state.phase}; send: ${settings.send}`,
+					"info",
+				);
+				return;
+			}
+			if (requested === "send auto" || requested === "send manual") {
+				setSendBehavior(requested === "send auto" ? "auto" : "manual", ctx);
 				return;
 			}
 			if (requested !== "hold" && requested !== "tap" && requested !== "off") {
-				ctx.ui.notify("Usage: /voice hold|tap|off|status", "warning");
+				ctx.ui.notify(`Usage: /voice ${VOICE_ARGS.join("|")}`, "warning");
 				return;
 			}
 			setMode(requested, ctx);
@@ -741,6 +817,12 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		disposed = false;
 		runtimeContext = ctx;
+		try {
+			settings = loadSettings();
+		} catch (error) {
+			settings = defaultSettings;
+			ctx.ui.notify(`Voice mode: ${errorMessage(error)}; using defaults`, "warning");
+		}
 		snapshot = { cwd: ctx.cwd, contextFiles: [] };
 		// Other extensions (notably pi-vim) may replace the editor later in this
 		// session_start dispatch. Wrap the final factory on the next event-loop turn.
