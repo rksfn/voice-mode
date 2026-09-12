@@ -10,7 +10,7 @@ microphone
   → formulated prompt inserted at the cursor
 ```
 
-Recording currently requires macOS and `ffmpeg`. Transcription uses OpenRouter. The rewrite step uses OpenAI Codex when configured, otherwise OpenRouter.
+Recording requires `ffmpeg` on macOS, Linux, or Windows. Transcription uses OpenRouter. The rewrite step uses OpenAI Codex when configured, otherwise OpenRouter.
 
 ## Install
 
@@ -60,7 +60,13 @@ The extension:
 ## Configuration
 
 ```bash
-VOICE_MODE_AUDIO_DEVICE=":0"               # ffmpeg avfoundation input
+VOICE_MODE_AUDIO_DEVICE=":0"               # ffmpeg input device (see below)
 VOICE_MODE_STT_MODEL=openai/whisper-large-v3-turbo
 VOICE_MODE_LANGUAGE=en
 ```
+
+Recording picks the OS's default microphone unless `VOICE_MODE_AUDIO_DEVICE` is set:
+
+- **macOS**: `ffmpeg -f avfoundation`. Default is `:0` (first listed device). List devices with `ffmpeg -f avfoundation -list_devices true -i ""`.
+- **Linux**: `ffmpeg -f pulse`, which also works on PipeWire via `pipewire-pulse`. Default is `default`. List sources with `pactl list short sources`.
+- **Windows**: `ffmpeg -f dshow`, which has no built-in "default" device, so voice-mode enumerates devices and uses the first audio capture device found. List devices with `ffmpeg -f dshow -list_devices true -i dummy` and set `VOICE_MODE_AUDIO_DEVICE` to the exact device name to pick a specific one.
