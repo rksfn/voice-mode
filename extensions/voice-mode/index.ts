@@ -14,6 +14,7 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { UserMessage } from "@earendil-works/pi-ai";
@@ -526,12 +527,14 @@ async function completeFormulation(
 	ctx: ExtensionContext,
 	signal: AbortSignal,
 ): Promise<string> {
+	// Nonce-suffixed delimiters: untrusted context text must not be able to close the region and forge a dictated note.
+	const tag = randomBytes(8).toString("hex");
 	const message: UserMessage = {
 		role: "user",
 		content: [
 			{
 				type: "text",
-				text: `<project-and-session-context>\n${context}\n</project-and-session-context>\n\n<dictated-note>\n${transcript}\n</dictated-note>`,
+				text: `<project-and-session-context-${tag}>\n${context}\n</project-and-session-context-${tag}>\n\n<dictated-note-${tag}>\n${transcript}\n</dictated-note-${tag}>`,
 			},
 		],
 		timestamp: Date.now(),
@@ -611,7 +614,7 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 			state.phase === "idle"
 				? theme.fg(
 						"muted",
-						settings.send === "auto" ? "ctrl+space to speak (auto-send)" : "ctrl+space to speak",
+						autoSendActive(runtimeContext) ? "ctrl+space to speak (auto-send)" : "ctrl+space to speak",
 					)
 				: `${
 						state.phase === "recording"
@@ -731,11 +734,26 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 					runtimeContext.ui.pasteToEditor(prompt);
 				}
 				apply({ type: "complete" });
-				if (settings.send === "auto") submitEditor(runtimeContext);
+				try {
+					settings = loadSettings();
+				} catch {
+					// Keep the last good in-memory setting if the file is unreadable.
+				}
+				if (autoSendActive(runtimeContext)) submitEditor(runtimeContext);
+				else if (settings.send === "auto")
+					runtimeContext.ui.notify(
+						"Voice mode: untrusted project; prompt is waiting in the editor for review",
+						"warning",
+					);
 			} catch (error) {
 				if (!disposed && !signal?.aborted) fail(error);
 			}
 		})();
+	}
+
+	/** Auto-send turns model output into a user turn with no review, so it stays inactive in untrusted projects. */
+	function autoSendActive(ctx: ExtensionContext): boolean {
+		return settings.send === "auto" && ctx.isProjectTrusted();
 	}
 
 	/** Submits whatever now stands in the editor, so an existing draft rides along as it would on enter. */
@@ -756,9 +774,11 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 		settings = { ...settings, send };
 		tui?.requestRender();
 		ctx.ui.notify(
-			send === "auto"
-				? "Voice mode: formulated prompts will be sent automatically"
-				: "Voice mode: formulated prompts will wait in the editor",
+			send === "manual"
+				? "Voice mode: formulated prompts will wait in the editor"
+				: autoSendActive(ctx)
+					? "Voice mode: formulated prompts will be sent automatically"
+					: "Voice mode: auto-send is on but stays inactive until this project is trusted",
 			"info",
 		);
 	}
@@ -798,10 +818,11 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 				requested = (await ctx.ui.select("Voice mode", VOICE_ARGS)) ?? "";
 			}
 			if (requested === "status") {
-				ctx.ui.notify(
-					`Voice mode: ${state.mode}; state: ${state.phase}; send: ${settings.send}`,
-					"info",
-				);
+				const send =
+					settings.send === "auto" && !autoSendActive(ctx)
+						? "auto (inactive: untrusted project)"
+						: settings.send;
+				ctx.ui.notify(`Voice mode: ${state.mode}; state: ${state.phase}; send: ${send}`, "info");
 				return;
 			}
 			if (requested === "send auto" || requested === "send manual") {
