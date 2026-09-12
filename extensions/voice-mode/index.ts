@@ -66,6 +66,7 @@ Scope:
 - Never introduce facts, names, constraints, options, or steps the speaker did not say.
 - Length tracks the intent, not the note and not the context. Say it once, in the fewest words that keep the whole request. Compress rambling, repetition, and thinking-out-loud. Never pad a short note.
 - An empty context and a full context must produce the same prompt apart from spelling.
+- Language tracks the dictated note, not the context or this instruction. Do not translate.
 
 Fidelity:
 - Separate substance from delivery. Hedges about wording ("the TypeScript file, or whatever it is") are delivery and collapse to the plain term. Uncertainty about what should happen is substance and stays.
@@ -444,7 +445,8 @@ async function transcribe(
 		body: JSON.stringify({
 			model: process.env.VOICE_MODE_STT_MODEL ?? DEFAULT_STT_MODEL,
 			input_audio: { data: audio.toString("base64"), format: "wav" },
-			language: process.env.VOICE_MODE_LANGUAGE ?? "en",
+			// Pinning "en" makes Whisper translate other languages into English.
+			language: process.env.VOICE_MODE_LANGUAGE?.trim() || undefined,
 			temperature: 0,
 		}),
 		signal: AbortSignal.any([signal, AbortSignal.timeout(120_000)]),

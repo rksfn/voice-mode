@@ -66,8 +66,10 @@ The extension:
 ```bash
 VOICE_MODE_AUDIO_DEVICE=":0"               # ffmpeg input device (see below)
 VOICE_MODE_STT_MODEL=openai/whisper-large-v3-turbo
-VOICE_MODE_LANGUAGE=en
+VOICE_MODE_LANGUAGE=hu                     # optional ISO-639-1 hint for Whisper; auto-detected if unset
 ```
+
+The formulated prompt stays in the transcript's language. Leave `VOICE_MODE_LANGUAGE` unset so Whisper detects what you speak. Pinning `en` makes it translate Hungarian, German, Spanish, and so on into English.
 
 Recording picks the OS's default microphone unless `VOICE_MODE_AUDIO_DEVICE` is set:
 
