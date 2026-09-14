@@ -7,15 +7,17 @@
  * Trigger: Ctrl+Space
  *
  * Speech is transcribed in segments while recording continues, so only the
- * trailing segment is outstanding when recording stops. GPT-5.6 Luna then
- * formulates the transcript using the current project/session context and the
- * result is inserted into the editor. /voice send decides whether it is then
- * submitted for you or held for review; manual is the default.
+ * trailing segment is outstanding when recording stops. Transient STT failures
+ * are retried until the transcript is complete or you press escape. The take is
+ * kept on disk so /voice retry can resume after cancel or restart.
+ * GPT-5.6 Luna then formulates the transcript using the current project/session
+ * context and the result is inserted into the editor. /voice send decides
+ * whether it is then submitted for you or held for review; manual is the default.
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { UserMessage } from "@earendil-works/pi-ai";
 import { CustomEditor, getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -59,6 +61,9 @@ const MAX_SEGMENT_WINDOWS = 100;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const ANIMATION_INTERVAL_MS = 90;
 const SETTINGS_FILE = "voice-mode.json";
+const LAST_RECORDING_FILE = "voice-mode-last.wav";
+const TRANSCRIBE_RETRY_MS = 500;
+const TRANSCRIBE_RETRY_MAX_MS = 15_000;
 
 const REWRITE_SYSTEM_PROMPT = `You turn a rough dictated voice note into a prompt for an AI coding agent that is already in this session and can already see the conversation.
 
@@ -239,6 +244,84 @@ function wavFromPcm(pcm: Buffer): Buffer {
 	header.write("data", 36);
 	header.writeUInt32LE(pcm.byteLength, 40);
 	return Buffer.concat([header, pcm]);
+}
+
+function lastRecordingPath(): string {
+	return join(getAgentDir(), LAST_RECORDING_FILE);
+}
+
+function saveLastRecording(pcm: Buffer): void {
+	mkdirSync(getAgentDir(), { recursive: true });
+	writeFileSync(lastRecordingPath(), wavFromPcm(pcm));
+}
+
+function loadLastRecordingPcm(): Buffer | undefined {
+	try {
+		const wav = readFileSync(lastRecordingPath());
+		if (wav.byteLength <= 44) return undefined;
+		return Buffer.from(wav.subarray(44));
+	} catch {
+		return undefined;
+	}
+}
+
+function clearLastRecording(): void {
+	try {
+		unlinkSync(lastRecordingPath());
+	} catch {
+		// No last recording to clear.
+	}
+}
+
+function hasLastRecording(): boolean {
+	return existsSync(lastRecordingPath());
+}
+
+function windowLevel(pcm: Buffer): number {
+	let sum = 0;
+	const samples = pcm.byteLength >> 1;
+	if (samples === 0) return 0;
+	for (let index = 0; index < samples; index++) {
+		const sample = pcm.readInt16LE(index << 1) / 32_768;
+		sum += sample * sample;
+	}
+	return Math.sqrt(sum / samples);
+}
+
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			signal.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+		};
+		if (signal.aborted) {
+			onAbort();
+			return;
+		}
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+function isRetryableTranscriptionError(error: unknown): boolean {
+	// AbortError/TimeoutError from the per-attempt timeout are retryable; the caller
+	// excludes a user cancel via the parent AbortSignal.
+	if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
+		return true;
+	}
+	const message = errorMessage(error);
+	if (/\b(408|429|500|502|503|504)\b/.test(message)) return true;
+	if (
+		/network connection lost|fetch failed|ECONNRESET|ETIMEDOUT|UND_ERR|socket|other side closed/i.test(
+			message,
+		)
+	) {
+		return true;
+	}
+	return error instanceof TypeError;
 }
 
 type RecordingPlatform = "darwin" | "linux" | "win32";
@@ -460,9 +543,27 @@ async function transcribe(
 	return payload.text?.trim() ?? "";
 }
 
+async function transcribeWithRetry(
+	audio: Buffer,
+	ctx: ExtensionContext,
+	signal: AbortSignal,
+): Promise<string> {
+	for (let attempt = 0; ; attempt++) {
+		if (signal.aborted) throw Object.assign(new Error("aborted"), { name: "AbortError" });
+		try {
+			return await transcribe(audio, ctx, signal);
+		} catch (error) {
+			if (signal.aborted || !isRetryableTranscriptionError(error)) throw error;
+			const ms = Math.min(TRANSCRIBE_RETRY_MAX_MS, TRANSCRIBE_RETRY_MS * 2 ** Math.min(attempt, 5));
+			await delay(ms, signal);
+		}
+	}
+}
+
 /** Cuts live audio into segments at silence and transcribes them as they are cut. */
 class StreamingTranscriber {
 	private windows: Buffer[] = [];
+	private readonly captured: Buffer[] = [];
 	private silentWindows = 0;
 	private voiced = false;
 	private readonly segments: Promise<string>[] = [];
@@ -473,6 +574,7 @@ class StreamingTranscriber {
 	) {}
 
 	push(window: Buffer, level: number): void {
+		this.captured.push(window);
 		this.windows.push(window);
 		if (level < SILENCE_RMS) {
 			this.silentWindows++;
@@ -487,12 +589,22 @@ class StreamingTranscriber {
 		if (cutOnSilence || this.windows.length >= MAX_SEGMENT_WINDOWS) this.cut();
 	}
 
+	recording(): Buffer {
+		return this.captured.length ? Buffer.concat(this.captured) : Buffer.alloc(0);
+	}
+
 	async finish(): Promise<string> {
 		this.cut();
-		const parts = await Promise.all(this.segments);
-		const transcript = parts.filter(Boolean).join(" ");
-		if (!transcript) throw new Error("Transcriber returned no text");
-		return transcript;
+		const results = await Promise.allSettled(this.segments);
+		const parts = results
+			.filter((result): result is PromiseFulfilledResult<string> => result.status === "fulfilled")
+			.map((result) => result.value)
+			.filter(Boolean);
+		if (parts.length) return parts.join(" ");
+		const failed = results.find((result) => result.status === "rejected");
+		throw failed && failed.status === "rejected"
+			? failed.reason
+			: new Error("Transcriber returned no text");
 	}
 
 	private cut(): void {
@@ -503,10 +615,24 @@ class StreamingTranscriber {
 		this.voiced = false;
 		// Whisper hallucinates stock phrases when handed pure silence.
 		if (!voiced) return;
-		const segment = transcribe(wavFromPcm(Buffer.concat(windows)), this.ctx, this.signal);
+		const segment = transcribeWithRetry(wavFromPcm(Buffer.concat(windows)), this.ctx, this.signal);
 		void segment.catch(() => {}); // the rejection is surfaced by finish()
 		this.segments.push(segment);
 	}
+}
+
+function feedPcm(transcriber: StreamingTranscriber, pcm: Buffer): void {
+	const windowBytes = LEVEL_WINDOW_SAMPLES * 2;
+	for (let offset = 0; offset + windowBytes <= pcm.byteLength; offset += windowBytes) {
+		const window = pcm.subarray(offset, offset + windowBytes);
+		transcriber.push(window, windowLevel(window));
+	}
+}
+
+function transcribePcm(pcm: Buffer, ctx: ExtensionContext, signal: AbortSignal): Promise<string> {
+	const stream = new StreamingTranscriber(ctx, signal);
+	feedPcm(stream, pcm);
+	return stream.finish();
 }
 
 function rewriteModel(ctx: ExtensionContext): NonNullable<ExtensionContext["model"]> {
@@ -674,8 +800,92 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 
 	function fail(error: unknown): void {
 		const message = errorMessage(error);
+		const retry = hasLastRecording()
+			? ` /voice retry to re-transcribe the last recording (${lastRecordingPath()}).`
+			: "";
 		apply({ type: "fail", message });
-		runtimeContext?.ui.notify(`Voice mode: ${message}`, "error");
+		runtimeContext?.ui.notify(`Voice mode: ${message}.${retry}`, "error");
+	}
+
+	function insertAtCursor(text: string): void {
+		if (editorComponent?.insertTextAtCursor) editorComponent.insertTextAtCursor(text);
+		else runtimeContext?.ui.pasteToEditor(text);
+	}
+
+	function rememberRecording(pcm: Buffer): void {
+		if (pcm.byteLength < 1_000) return;
+		try {
+			saveLastRecording(pcm);
+		} catch (error) {
+			runtimeContext?.ui.notify(
+				`Voice mode: could not save recording for retry: ${errorMessage(error)}`,
+				"warning",
+			);
+		}
+	}
+
+	async function afterTranscript(
+		transcript: string,
+		ctx: ExtensionContext,
+		signal: AbortSignal,
+	): Promise<void> {
+		if (disposed || signal.aborted || !snapshot) return;
+		apply({ type: "stage", phase: "formulating" });
+		const context = buildContext(ctx, snapshot, draftAtStart);
+		let prompt: string;
+		try {
+			prompt = await formulate(transcript, context, ctx, signal);
+		} catch (error) {
+			if (disposed || signal.aborted) return;
+			insertAtCursor(transcript);
+			apply({ type: "complete" });
+			ctx.ui.notify(
+				`Voice mode: formulation failed (${errorMessage(error)}); raw transcript is in the editor. /voice retry to try again.`,
+				"warning",
+			);
+			return;
+		}
+		if (disposed || signal.aborted) return;
+		insertAtCursor(prompt);
+		apply({ type: "complete" });
+		clearLastRecording();
+		try {
+			settings = loadSettings();
+		} catch {
+			// Keep the last good in-memory setting if the file is unreadable.
+		}
+		if (autoSendActive(ctx)) submitEditor(ctx);
+		else if (settings.send === "auto")
+			ctx.ui.notify(
+				"Voice mode: untrusted project; prompt is waiting in the editor for review",
+				"warning",
+			);
+	}
+
+	function retryLastRecording(ctx: ExtensionCommandContext): void {
+		if (state.phase !== "idle") {
+			ctx.ui.notify("Finish or cancel the current recording before retrying", "warning");
+			return;
+		}
+		const pcm = loadLastRecordingPcm();
+		if (!pcm) {
+			ctx.ui.notify("Voice mode: no last recording to retry", "warning");
+			return;
+		}
+		runtimeContext = ctx;
+		snapshot = { cwd: ctx.cwd, contextFiles: ctx.getSystemPromptOptions().contextFiles ?? [] };
+		draftAtStart = ctx.ui.getEditorText();
+		if (state.mode !== "off") patchEditor(ctx);
+		pipeline = new AbortController();
+		const signal = pipeline.signal;
+		apply({ type: "stage", phase: "transcribing" });
+		void (async () => {
+			try {
+				await afterTranscript(await transcribePcm(pcm, ctx, signal), ctx, signal);
+			} catch (error) {
+				if (!disposed && !signal.aborted) fail(error);
+			}
+		})();
 	}
 
 	function runEffect(effect: VoiceEffect): void {
@@ -720,31 +930,13 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 					throw new Error("No active recording");
 				}
 				const recorder = await pendingRecording;
-				await recorder.stop();
-				if (disposed || signal.aborted) return;
-				const transcript = await pendingTranscriber.finish();
-				if (disposed || signal.aborted) return;
-				apply({ type: "stage", phase: "formulating" });
-				const context = buildContext(runtimeContext, snapshot, draftAtStart);
-				const prompt = await formulate(transcript, context, runtimeContext, signal);
-				if (disposed || signal.aborted) return;
-				if (editorComponent?.insertTextAtCursor) {
-					editorComponent.insertTextAtCursor(prompt);
-				} else {
-					runtimeContext.ui.pasteToEditor(prompt);
-				}
-				apply({ type: "complete" });
 				try {
-					settings = loadSettings();
-				} catch {
-					// Keep the last good in-memory setting if the file is unreadable.
+					await recorder.stop();
+				} finally {
+					if (!disposed && !signal.aborted) rememberRecording(pendingTranscriber.recording());
 				}
-				if (autoSendActive(runtimeContext)) submitEditor(runtimeContext);
-				else if (settings.send === "auto")
-					runtimeContext.ui.notify(
-						"Voice mode: untrusted project; prompt is waiting in the editor for review",
-						"warning",
-					);
+				if (disposed || signal.aborted) return;
+				await afterTranscript(await pendingTranscriber.finish(), runtimeContext, signal);
 			} catch (error) {
 				if (!disposed && !signal?.aborted) fail(error);
 			}
@@ -799,10 +991,10 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 		apply({ type: "set-mode", mode });
 	}
 
-	const VOICE_ARGS = ["hold", "tap", "off", "send auto", "send manual", "status"];
+	const VOICE_ARGS = ["hold", "tap", "off", "send auto", "send manual", "retry", "status"];
 
 	pi.registerCommand("voice", {
-		description: "Set context-aware voice input: /voice hold|tap|off|send auto|send manual|status",
+		description: "Set context-aware voice input: /voice hold|tap|off|send auto|send manual|retry|status",
 		getArgumentCompletions: (prefix) =>
 			VOICE_ARGS.filter((value) => value.startsWith(prefix)).map((value) => ({
 				value,
@@ -822,7 +1014,12 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 					settings.send === "auto" && !autoSendActive(ctx)
 						? "auto (inactive: untrusted project)"
 						: settings.send;
-				ctx.ui.notify(`Voice mode: ${state.mode}; state: ${state.phase}; send: ${send}`, "info");
+				const retry = hasLastRecording() ? "; last recording available for /voice retry" : "";
+				ctx.ui.notify(`Voice mode: ${state.mode}; state: ${state.phase}; send: ${send}${retry}`, "info");
+				return;
+			}
+			if (requested === "retry") {
+				retryLastRecording(ctx);
 				return;
 			}
 			if (requested === "send auto" || requested === "send manual") {
@@ -854,11 +1051,18 @@ export default function voiceModeExtension(pi: ExtensionAPI) {
 			if (!disposed && state.mode !== "off") patchEditor(ctx);
 		}, 0);
 		ctx.ui.onTerminalInput((data) => {
-			if (state.mode === "off") return;
 			if (state.phase !== "idle" && matchesKey(data, CANCEL_KEY)) {
+				const kept = state.phase !== "recording" && hasLastRecording();
 				apply({ type: "cancel" });
+				if (kept) {
+					ctx.ui.notify(
+						"Voice mode: last recording kept; /voice retry to try again",
+						"info",
+					);
+				}
 				return { consume: true };
 			}
+			if (state.mode === "off") return;
 			if (!matchesKey(data, TRIGGER_KEY)) return;
 			const event = isKeyRelease(data) ? "release" : isKeyRepeat(data) ? "repeat" : "press";
 			apply({ type: "trigger", event });

@@ -47,6 +47,7 @@ Inside pi, use `/voice` to change modes:
 /voice off
 /voice send auto     submit the formulated prompt automatically
 /voice send manual   leave it in the editor for review (default)
+/voice retry         re-transcribe the last take (after cancel or restart)
 /voice status
 ```
 
@@ -57,9 +58,10 @@ Inside pi, use `/voice` to change modes:
 The extension:
 
 1. Records with `ffmpeg`.
-2. Transcribes with OpenRouter Whisper (pi's OpenRouter login or `OPENROUTER_API_KEY`) while you are still speaking: audio is cut into segments at pauses, and each segment is sent as soon as it is cut, so only the last segment is outstanding when you stop.
-3. Gives the transcript, cwd, loaded context files, recent conversation, and current editor draft to GPT-5.6 Luna.
+2. Transcribes with OpenRouter Whisper (pi's OpenRouter login or `OPENROUTER_API_KEY`) while you are still speaking: audio is cut into segments at pauses, and each segment is sent as soon as it is cut, so only the last segment is outstanding when you stop. Transient failures (502, timeouts, dropped connections) are retried automatically until the transcript is complete or you press escape.
+3. Gives the transcript, cwd, loaded context files, recent conversation, and current editor draft to GPT-5.6 Luna. If formulation fails, the raw transcript is inserted instead.
 4. Inserts the formulated prompt at the cursor, and submits it when `send` is `auto`.
+5. After you stop, the take is written to `~/.pi/agent/voice-mode-last.wav` and deleted only after a clean transcription and formulation. That file is what lets retries continue after a cancel or a pi restart (`/voice retry`).
 
 ## Configuration
 

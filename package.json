@@ -1,6 +1,6 @@
 {
   "name": "@rksfn/voice-mode",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Context-aware voice input for pi. Speak a request, get a formulated prompt at the cursor.",
   "license": "MIT",
   "author": "Erik Safian",
